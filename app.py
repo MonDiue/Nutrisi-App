@@ -94,7 +94,7 @@ def hitung_target_via_ai(profil):
         
     try:
         response = st.session_state.client.models.generate_content(
-            model='gemini-3.5-flash', contents=prompt,
+            model='gemini-2.0-flash', contents=prompt,
             config=types.GenerateContentConfig(response_mime_type="application/json")
         )
         return json.loads(response.text)
@@ -144,7 +144,7 @@ def analisis_foto_makanan_ai(gambar_pil):
     """
     try:
         response = st.session_state.client.models.generate_content(
-            model='gemini-3.5-flash', contents=[gambar_pil, prompt],
+            model='gemini-2.0-flash', contents=[gambar_pil, prompt],
             config=types.GenerateContentConfig(response_mime_type="application/json")
         )
         return json.loads(response.text)
@@ -173,7 +173,7 @@ def rekalkulasi_nutrisi_via_ai(nama, bagian, metode, gramasi):
     """
     try:
         response = st.session_state.client.models.generate_content(
-            model='gemini-3.5-flash', contents=prompt,
+            model='gemini-2.0-flash', contents=prompt,
             config=types.GenerateContentConfig(response_mime_type="application/json")
         )
         return json.loads(response.text)
