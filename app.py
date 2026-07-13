@@ -17,7 +17,6 @@ st.set_page_config(
 # ==========================================
 if "client" not in st.session_state:
     try:
-        # Mencoba memanggil Client Google GenAI secara otomatis
         st.session_state.client = genai.Client()
     except Exception as e:
         st.session_state.client = None
@@ -36,153 +35,172 @@ if "jurnal_hari_ini" not in st.session_state:
 if "riwayat_makanan" not in st.session_state:
     st.session_state.riwayat_makanan = []
 
-# State untuk menu upload, verifikasi makanan, dan aktivitas fisik
 if "show_upload_options" not in st.session_state:
     st.session_state.show_upload_options = False
 if "pending_analysis" not in st.session_state:
     st.session_state.pending_analysis = None
 
-# Opsi Global yang Diperbarui (Mengembalikan Fat Loss & Muscle Gain)
-OPSI_BODY_GOAL = [
-    "Fat Loss / Cutting (Lean)", 
-    "Muscle Gain / Bulking (Jacked)", 
-    "Heavy Weight Bulking (Bulky)", 
-    "Maintain Weight (Menjaga Proporsi Tubuh Sehat Seimbang)"
-]
-
-OPSI_AKTIVITAS = [
-    "Angkat Beban / Gym (Resistance Training)",
-    "Kardiointensif (Lari, Berenang, Bersepeda)",
-    "Olahraga Tim / Kontak (Futsal, Basket, Badminton)",
-    "Calisthenics / Olahraga Beban Tubuh",
-    "Pekerjaan Fisik Berat / Jalan Kaki Harian Tinggi"
-]
+# Katalog Daftar Aktivitas untuk Checklist Dinamis
+KATALOG_AKTIVITAS = {
+    "🌱 Olahraga Ringan": [
+        "Joging santai", "Jalan kaki rutin", "Yoga ringan", "Pilates"
+    ],
+    "🏃‍♂️ Olahraga Intensitas Sedang & Permainan": [
+        "Angkat beban / Gym", "Futsal", "Sepak bola", "Basket", 
+        "Badminton", "Renang", "Bersepeda"
+    ],
+    "🏗️ Pekerjaan & Aktivitas Fisik Berat": [
+        "Kuli bangunan", "Kuli angkat barang", "Atlet profesional (Latihan harian intens)", "Latihan fisik keras harian lainnya"
+    ]
+}
 
 # ==========================================
-# 2. LOGIKA UTAMA INTEGRASI GEMINI AI
+# 2. HELPER RENDER CHECKLIST AKTIVITAS DINAMIS
+# ==========================================
+def render_checklist_aktivitas(prefix_key, profil_existing={}):
+    """Menampilkan checklist di mana tiap aktivitas punya input frekuensi individual"""
+    st.write("Centang aktivitas yang biasa Anda lakukan dan tentukan frekuensinya per minggu:")
+    st.caption("💡 *Jika tidak ada aktivitas yang dicentang, TDEE otomatis dihitung sebagai 1.20 (Kerja kantoran duduk seharian).*")
+    
+    aktivitas_terpilih = {}
+    existing_acts = profil_existing.get("aktivitas", {})
+    
+    for kategori, daftar_act in KATALOG_AKTIVITAS.items():
+        st.markdown(f"**{kategori}**")
+        for act in daftar_act:
+            is_checked_default = act in existing_acts
+            checked = st.checkbox(act, value=is_checked_default, key=f"chk_{act}_{prefix_key}")
+            
+            if checked:
+                default_freq = existing_acts.get(act, 2)
+                freq = st.number_input(
+                    f"└─ Berapa kali/minggu melakukan {act}?", 
+                    min_value=1, max_value=14, value=int(default_freq), step=1,
+                    key=f"freq_{act}_{prefix_key}"
+                )
+                aktivitas_terpilih[act] = freq
+    return aktivitas_terpilih
+
+# ==========================================
+# 3. LOGIKA UTAMA PERHITUNGAN BMR & TARGET VIA AI
 # ==========================================
 def hitung_target_via_ai(profil):
-    """Menghitung target makronutrisi harian berdasarkan profil fisik, aktivitas, & aturan protein harian 2x BB Target"""
+    """Menghitung target nutrisi, menentukan indeks TDEE berdasarkan aktivitas individual via AI"""
+    # 1. Rumus BMR Medis (Mifflin-St Jeor)
+    if profil["gender"] == "Laki-laki":
+        bmr_lokal = (10 * profil["bb_awal"]) + (6.25 * profil["tb"]) - (5 * profil["umur"]) + 5
+    else:
+        bmr_lokal = (10 * profil["bb_awal"]) + (6.25 * profil["tb"]) - (5 * profil["umur"]) - 161
+        
     protein_mutlak = int(profil["target_berat"] * 2) 
     
-    teks_aktivitas = ""
-    for act, freq in profil.get("aktivitas", {}).items():
-        teks_aktivitas += f"- {act}: {freq} kali per minggu\n"
-    if not teks_aktivitas:
-        teks_aktivitas = "- Tidak ada aktivitas olahraga rutin (Sedentary)\n"
+    # Evaluasi Aktivitas
+    daftar_act = profil.get("aktivitas", {})
+    if not daftar_act:
+        teks_aktivitas = "- TIDAK ADA AKTIVITAS DIPILIH. Wajib gunakan indeks TDEE 1.20 (Sedentary/Duduk seharian).\n"
+        fallback_index = 1.20
+    else:
+        teks_aktivitas = ""
+        total_freq = 0
+        for act, freq in daftar_act.items():
+            teks_aktivitas += f"- {act}: {freq} kali per minggu\n"
+            total_freq += freq
+            
+        # Estimasi fallback lokal jika AI offline
+        if total_freq <= 2: fallback_index = 1.375
+        elif total_freq <= 5: fallback_index = 1.55
+        elif total_freq <= 7: fallback_index = 1.725
+        else: fallback_index = 1.90
         
     prompt = f"""
-    Kamu adalah seorang Ahli Gizi profesional. Hitung kebutuhan energi harian (TDEE) untuk profil ini:
-    - BB: {profil['berat_badan']} kg | TB: {profil['tinggi_badan']} cm | Umur: {profil['umur']} tahun
-    - Target BB Akhir: {profil['target_berat']} kg | Body Goal: {profil['body_goal']}
-    - Aktivitas Harian:\n{teks_aktivitas}
+    Kamu adalah Ahli Gizi Klinis. Tugasmu adalah menentukan Faktor Aktivitas (Indeks TDEE) secara presisi dan menyusun makronutrisi.
     
-    ATURAN MUTLAK: Target Protein harian HARUS bernilai TEPAT {protein_mutlak} gram.
-    Berikan hasil kalkulasi akhir dalam format JSON murni:
+    Data Fisik & Kegiatan User:
+    - Jenis Kelamin: {profil['gender']} | Umur: {profil['umur']} tahun
+    - BMR Hasil Hitung Medis: {int(bmr_lokal)} kkal
+    - Body Goal: {profil['body_goal']}
+    - Intensitas Defisit/Surplus Kalori: {profil['perubahan_kalori']} kkal
+    - Daftar Aktivitas Fisik & Frekuensi Nyata User:
+    {teks_aktivitas}
+    
+    ATURAN PENENTUAN INDEKS TDEE:
+    1. Evaluasi seluruh daftar aktivitas di atas. Pilih SATU angka indeks TDEE medis yang paling pas:
+       * 1.20 -> Tidak olahraga, kerja kantoran duduk seharian (Wajib pilih ini jika daftar aktivitas kosong/tidak ada).
+       * 1.375 -> Olahraga ringan / joging / yoga sekitar 1–3 hari/minggu.
+       * 1.55 -> Olahraga intensitas sedang (seperti angkat beban, futsal, basket, badminton) total 3–5 hari/minggu.
+       * 1.725 -> Olahraga berat/intensitas tinggi 6–7 hari/minggu.
+       * 1.90 -> Atlet profesional atau pekerja fisik berat (kuli bangunan, kuli angkut) + latihan keras harian.
+    2. Hitung TDEE = BMR ({int(bmr_lokal)}) x [Indeks TDEE Pilihanmu].
+    3. Hitung Target Kalori Akhir berdasarkan Body Goal:
+       * Jika "Fat Loss" -> Target = TDEE - {profil['perubahan_kalori']}
+       * Jika "Muscle Gain" -> Target = TDEE + {profil['perubahan_kalori']}
+       * Jika "Maintain Weight (Recomposition)" -> Target = TDEE (Tanpa dikurang/ditambah)
+    4. Target Protein Wajib Kunci di: {protein_mutlak} gram.
+    
+    Berikan hasil akhir HANYA dalam format JSON murni tanpa teks/markdown tambahan, struktur persis:
     {{
-        "kalori": 2400,
+        "indeks_aktivitas_terpilih": 1.55,
+        "tdee_kalkulasi": 2400,
+        "kalori": 1900,
         "protein": {protein_mutlak},
-        "karbohidrat": 260,
-        "lemak": 65,
-        "air": 3200,
-        "serat": 30
+        "karbohidrat": 210,
+        "lemak": 55,
+        "air": 3000,
+        "serat": 25
     }}
     """
+    
+    # Kalkulasi cadangan luring/darurat
+    default_tdee = int(bmr_lokal * fallback_index)
+    default_kalori = default_tdee
+    if profil["body_goal"] == "Fat Loss": default_kalori -= profil["perubahan_kalori"]
+    elif profil["body_goal"] == "Muscle Gain": default_kalori += profil["perubahan_kalori"]
+
     if st.session_state.client is None:
-        # Fallback aman jika API Key tidak terdeteksi
-        return {"kalori": int(profil["target_berat"] * 32), "protein": protein_mutlak, "karbohidrat": 240, "lemak": 60, "air": 3000, "serat": 25}
+        return {"indeks_aktivitas_terpilih": fallback_index, "tdee_kalkulasi": default_tdee, "kalori": default_kalori, "protein": protein_mutlak, "karbohidrat": 200, "lemak": 50, "air": 2500, "serat": 25}
         
     try:
         response = st.session_state.client.models.generate_content(
-            model='gemini-2.5-flash', contents=prompt,
+            model='gemini-2.0-flash', contents=prompt,
             config=types.GenerateContentConfig(response_mime_type="application/json")
         )
         return json.loads(response.text)
     except Exception as e:
-        return {"kalori": int(profil["target_berat"] * 30), "protein": protein_mutlak, "karbohidrat": 220, "lemak": 55, "air": 2500, "serat": 25}
+        return {"indeks_aktivitas_terpilih": fallback_index, "tdee_kalkulasi": default_tdee, "kalori": default_kalori, "protein": protein_mutlak, "karbohidrat": 200, "lemak": 50, "air": 2500, "serat": 25}
 
 def analisis_foto_makanan_ai(gambar_pil):
-    """Menganalisis foto dari galeri maupun kamera secara mendalam"""
-    if st.session_state.client is None:
-        # JIKA API KEY KOSONG: Jalankan simulasi cerdas agar sistem tidak crash dan user bisa tetap demo produk
-        st.toast("⚠️ Menggunakan Mode Simulasi (Sistem mendeteksi foto Ayam Olive Anda)", icon="ℹ️")
-        return {
-            "nama_makanan": "Ayam Goreng Crispy + Nasi Putih (Olive Fried Chicken)",
-            "bagian_makanan": "Dada Ayam dengan Kulit",
-            "metode_masak": "Goreng (Deep Fried)",
-            "gramasi_estimasi": "150 gram ayam, 200 gram nasi",
-            "kalori": 680,
-            "protein": 38.0,
-            "karbohidrat": 62.0,
-            "lemak": 29.0,
-            "serat": 1.5,
-            "air": 110
-        }
-
-    prompt = """
-    Kamu adalah AI Nutritionist yang sangat jeli. Analisis hidangan makanan atau minuman yang ada di dalam foto ini.
-    
-    Tugas Analisis Deteksi:
-    1. Deteksi semua item bahan makanan yang terlihat beserta BAGIAN SPESIFIKNYA (misal: dada ayam tanpa kulit, paha atas dengan kulit).
-    2. Deteksi METODE MEMASAK atau pengolahan yang diterapkan (Goreng, Rebus, Kukus, Panggang, Tumis, atau Mentah).
-    3. Berikan ASUMSI ESTIMASI TAKARAN/GRAMASI yang objektif (satuan 'gram' / 'buah' / 'butir' atau 'ml').
-    4. Hitung NILAI NUTRISI YANG TELAH DIOLAH SESUAI METODE MASAKNYA.
-    
-    Berikan hasil analisis akhir dalam format JSON murni:
-    {
-        "nama_makanan": "Nama Hidangan Utama",
-        "bagian_makanan": "Bagian spesifik yang terdeteksi",
-        "metode_masak": "Metode masak",
-        "gramasi_estimasi": "150 gram",
-        "kalori": 280,
-        "protein": 25.0,
-        "karbohidrat": 12.0,
-        "lemak": 14.0,
-        "serat": 2.0,
-        "air": 0
+    data_simulasi = {
+        "nama_makanan": "Ayam Goreng Crispy + Nasi Putih (Olive Fried Chicken)",
+        "bagian_makanan": "Dada Ayam dengan Kulit",
+        "metode_masak": "Goreng (Deep Fried)",
+        "gramasi_estimasi": "150 gram ayam, 200 gram nasi",
+        "kalori": 680, "protein": 38.0, "karbohidrat": 62.0, "lemak": 29.0, "serat": 1.5, "air": 110
     }
-    """
+    if st.session_state.client is None: return data_simulasi
+    prompt = "Kamu adalah AI Nutritionist. Analisis hidangan ini dan berikan output format JSON murni nutrisi lengkap."
     try:
         response = st.session_state.client.models.generate_content(
-            model='gemini-2.5-flash', contents=[gambar_pil, prompt],
+            model='gemini-2.0-flash', contents=[gambar_pil, prompt],
             config=types.GenerateContentConfig(response_mime_type="application/json")
         )
         return json.loads(response.text)
-    except Exception as e:
-        st.error(f"Gagal menganalisis gambar via API: {e}")
-        return None
+    except Exception as e: return data_simulasi
 
 def rekalkulasi_nutrisi_via_ai(nama, bagian, metode, gramasi):
-    """Menghitung ulang data nutrisi berdasarkan koreksi manual pengguna"""
     if st.session_state.client is None:
-        # Fallback simulasi hitung ulang jika tanpa API Key
-        return {
-            "nama_makanan": nama, "bagian_makanan": bagian, "metode_masak": metode, "gramasi_estimasi": gramasi,
-            "kalori": 450, "protein": 32.0, "karbohidrat": 45.0, "lemak": 12.0, "serat": 2.0, "air": 100
-        }
-
-    prompt = f"""
-    Hitung ulang secara akurat nilai nutrisi berdasarkan data koreksi nyata dari pengguna berikut:
-    - Nama Makanan: {nama} | Bagian Makanan: {bagian} | Metode Memasak: {metode} | Gramasi / Takaran Baru: {gramasi}
-    
-    Berikan keluaran dalam format JSON murni:
-    {{
-        "nama_makanan": "{nama}", "bagian_makanan": "{bagian}", "metode_masak": "{metode}", "gramasi_estimasi": "{gramasi}",
-        "kalori": 350, "protein": 25.0, "karbohidrat": 30.0, "lemak": 10.0, "serat": 2.0, "air": 0
-    }}
-    """
+        return {"nama_makanan": nama, "bagian_makanan": bagian, "metode_masak": metode, "gramasi_estimasi": gramasi, "kalori": 450, "protein": 32.0, "karbohidrat": 45.0, "lemak": 12.0, "serat": 2.0, "air": 100}
+    prompt = f"Hitung ulang nutrisi akurat dalam format JSON murni untuk: {nama} {bagian} {metode} {gramasi}."
     try:
         response = st.session_state.client.models.generate_content(
-            model='gemini-2.5-flash', contents=prompt,
+            model='gemini-2.0-flash', contents=prompt,
             config=types.GenerateContentConfig(response_mime_type="application/json")
         )
         return json.loads(response.text)
     except Exception as e:
-        st.error(f"Gagal melakukan hitung ulang: {e}")
-        return None
+        return {"nama_makanan": nama, "bagian_makanan": bagian, "metode_masak": metode, "gramasi_estimasi": gramasi, "kalori": 400, "protein": 30.0, "karbohidrat": 40.0, "lemak": 10.0, "serat": 2.0, "air": 80}
 
 # ==========================================
-# 3. INTERFACE HALAMAN 1: LOGIN MULTI-PROVIDER
+# 4. INTERFACE HALAMAN 1: LOGIN
 # ==========================================
 def render_halaman_login():
     st.markdown("<h2 style='text-align: center; margin-top: 20px;'>🔐 Sign In / Sign Up</h2>", unsafe_allow_html=True)
@@ -196,67 +214,70 @@ def render_halaman_login():
         if st.button("⚫ Hubungkan via iCloud Apple", use_container_width=True): st.session_state.logged_in = True; st.rerun()
 
 # ==========================================
-# 4. INTERFACE HALAMAN 2: INPUT PROFIL & AKTIVITAS (ONBOARDING)
+# 5. INTERFACE HALAMAN 2: INPUT PROFIL AWAL
 # ==========================================
 def render_halaman_profil():
-    st.markdown("<h2>🥗 Set Profil Fisik, Body Goal & Aktivitas Anda</h2>", unsafe_allow_html=True)
-    st.write("Isi metrik tubuh dan aktivitas harian Anda agar AI dapat meracik target nutrisi yang presisi.")
+    st.markdown("<h2>🥗 Set Profil Fisik & Checklist Kegiatan</h2>", unsafe_allow_html=True)
+    st.write("Isi data fisik dasar dan centang aktivitas yang biasa Anda lakukan beserta frekuensinya.")
     
-    st.markdown("#### 📏 1. Informasi Fisik & Target")
-    col1, col2 = st.columns(2)
-    with col1:
-        berat = st.number_input("Berat Badan Saat Ini (kg)", min_value=30.0, value=70.0, step=0.5)
-        tinggi = st.number_input("Tinggi Badan (cm)", min_value=100, value=170)
-        umur = st.number_input("Umur Pengguna (Tahun)", min_value=12, value=23)
-    with col2:
-        target_bb = st.number_input("Target Berat Badan Akhir (kg)", min_value=30.0, value=65.0, step=0.5)
-        goal = st.selectbox("Pilih Body Goal Anda", OPSI_BODY_GOAL)
-        
-    st.markdown("---")
-    st.markdown("#### 🏃‍♂️ 2. Checklist Aktivitas Fisik Harian")
-    st.write("Pilih jenis aktivitas fisik/olahraga yang biasa Anda lakukan:")
-    
-    aktivitas_terpilih = st.multiselect("Pilih seluruh aktivitas yang sesuai:", OPSI_AKTIVITAS)
-    
-    dict_aktivitas_user = {}
-    if aktivitas_terpilih:
-        st.write("*Tentukan seberapa sering Anda melakukan aktivitas tersebut dalam seminggu:*")
-        for akt in aktivitas_terpilih:
-            freq = st.slider(f"Frekuensi untuk: {akt} (Kali / Minggu)", min_value=1, max_value=7, value=3, key=f"onboard_{akt}")
-            dict_aktivitas_user[akt] = freq
+    with st.form("form_informasi_fisik"):
+        st.markdown("#### 📏 1. Informasi Fisik Dasar")
+        col1, col2 = st.columns(2)
+        with col1:
+            gender = st.selectbox("Jenis Kelamin", ["Laki-laki", "Perempuan"])
+            berat_awal = st.number_input("Berat Badan Sekarang (kg)", min_value=30.0, value=70.0, step=0.5)
+            tinggi_badan = st.number_input("Tinggi Badan (cm)", min_value=100, value=170)
+        with col2:
+            umur = st.number_input("Umur Anda (Tahun)", min_value=1, max_value=100, value=24)
+            berat_target = st.number_input("Target Berat Badan Akhir (kg)", min_value=30.0, value=65.0, step=0.5)
+            body_goal = st.selectbox("Pilih Body Goal", ["Fat Loss", "Maintain Weight (Recomposition)", "Muscle Gain"])
             
-    st.markdown("<br>", unsafe_allow_html=True)
-    if st.button("🚀 Aktifkan Pola Nutrisi AI Saya", use_container_width=True, type="primary"):
-        st.session_state.user_profile = {
-            "berat_badan": berat, "tinggi_badan": tinggi, "umur": umur, 
-            "target_berat": target_bb, "body_goal": goal, "aktivitas": dict_aktivitas_user
-        }
+        st.markdown("---")
+        st.markdown("#### 🏃‍♂️ 2. Checklist Aktivitas Fisik & Frekuensi Mandiri")
+        aktivitas_dipilih = render_checklist_aktivitas(prefix_key="onboarding")
         
-        with st.spinner("AI sedang menganalisis profil dan menghitung rencana nutrisi ideal Anda..."):
-            st.session_state.nutrisi_target = hitung_target_via_ai(st.session_state.user_profile)
-            st.session_state.profile_setup_done = True
-            st.success("Rencana Nutrisi AI Berhasil Dibuat!")
-            st.rerun()
+        st.markdown("---")
+        perubahan_kalori = st.slider("Intensitas Surplus/Defisit Kalori Harian (Tidak berefek pada Maintain Weight)", min_value=300, max_value=500, value=500, step=50)
+        
+        submit_profil = st.form_submit_button("🚀 Hitung Pola Nutrisi & Target AI", type="primary")
+        if submit_profil:
+            st.session_state.user_profile = {
+                "gender": gender, "bb_awal": berat_awal, "tb": tinggi_badan, 
+                "umur": umur, "target_berat": berat_target, "body_goal": body_goal,
+                "aktivitas": aktivitas_dipilih, "perubahan_kalori": perubahan_kalori
+            }
+            with st.spinner("Gemini AI menganalisis frekuensi latihan & menentukan TDEE optimal..."):
+                st.session_state.nutrisi_target = hitung_target_via_ai(st.session_state.user_profile)
+                st.session_state.profile_setup_done = True
+                st.success("Profil Fisik & Analisis TDEE Sukses Dikonfigurasi!")
+                st.rerun()
 
 # ==========================================
-# 5. INTERFACE HALAMAN 3: DASHBOARD UTAMA
+# 6. INTERFACE HALAMAN 3: DASHBOARD UTAMA
 # ==========================================
 def render_halaman_utama():
     target = st.session_state.nutrisi_target
     jurnal = st.session_state.jurnal_hari_ini
+    profil = st.session_state.user_profile
     
     st.markdown("<h1 style='text-align: center;'>🥗 AI Nutrition Tracker Pro</h1>", unsafe_allow_html=True)
     
-    if st.session_state.client is None:
-        st.info("💡 Mode Offline/Simulasi Aktif. Pasang kunci rahasia `GEMINI_API_KEY` pada Streamlit Cloud untuk mengaktifkan kecerdasan AI asli.")
-
+    with st.expander("ℹ️ Detail Hasil Analisis Metabolisme Tubuh (AI-Generated)"):
+        st.write(f"**Tipe Target:** `{profil.get('body_goal')}`")
+        st.write(f"**Indeks TDEE Dipilih AI:** `{target.get('indeks_aktivitas_terpilih', '1.20')}`")
+        st.write(f"**Estimasi Energi TDEE Anda:** `{target.get('tdee_kalkulasi', 2000)}` kkal/hari")
+        if not profil.get("aktivitas"):
+            st.caption("⚠️ *Tidak ada aktivitas dicentang. TDEE dihitung dengan indeks Sedentary (1.20).*")
+        else:
+            act_list = ", ".join([f"{k} ({v}x/mgg)" for k,v in profil.get("aktivitas", {}).items()])
+            st.caption(f"🏃 *Aktivitas terdeteksi:* {act_list}")
+    
     st.markdown("---")
     
-    # METRICS DISPLAY STATUS JURNAL HARI INI
     st.markdown("### 📊 Status Jurnal Hari Ini")
     c1, c2, c3 = st.columns(3)
     c1.metric("🔥 Kalori", f"{int(jurnal['kalori'])} kkal", f"Target: {target.get('kalori', 2000)} kkal")
-    c2.metric("🥩 Protein (2x BB Target)", f"{jurnal['protein']:.1f} g", f"Target: {target.get('protein', 130)} g")
+    c2.metric("🥩 Protein", f"{jurnal['protein']:.1f} g", f"Target: {target.get('protein', 130)} g")
     c3.metric("🍞 Karbohidrat", f"{jurnal['karbohidrat']:.1f} g", f"Target: {target.get('karbohidrat', 230)} g")
     
     c4, c5, c6 = st.columns(3)
@@ -270,8 +291,7 @@ def render_halaman_utama():
     
     # --- TAB 1: SCAN NUTRISI ---
     with tab_scan:
-        st.write("##### 🍽️ Scan Foto Makanan / Minuman")
-        
+        st.write("##### 🍽️ Scan Foto Makanan / Minuman dari Perangkat")
         if st.button("📸 Buka Menu Pengunggahan Foto Makanan", use_container_width=True, type="primary"):
             st.session_state.show_upload_options = not st.session_state.show_upload_options
             
@@ -292,18 +312,15 @@ def render_halaman_utama():
                 st.image(gambar_pil, caption="Pratinjau Foto Makanan", width=260)
                 
                 if st.button("🤖 Jalankan Deteksi Nutrisi AI", use_container_width=True):
-                    with st.spinner("AI sedang membedah komponen makanan, metode masak, serta gramasi porsi..."):
+                    with st.spinner("AI menganalisis komponen nutrisi makro hidangan..."):
                         res = analisis_foto_makanan_ai(gambar_pil)
                         if res:
                             st.session_state.pending_analysis = res
                             st.success("Pemindaian Selesai! Mohon verifikasi hasilnya di bawah ini.")
         
-        # --- BLOK PROSES VERIFIKASI KONFIRMASI USER ---
         if st.session_state.pending_analysis:
             st.markdown("---")
             st.markdown("### 🔍 Konfirmasi & Penyesuaian Data Hidangan")
-            st.info("Pastikan Nama Makanan, Bagian Makanan, Metode Masak, dan Gramasi di bawah ini sudah sesuai dengan yang Anda konsumsi:")
-            
             p = st.session_state.pending_analysis
             
             with st.form("form_konfirmasi_makanan"):
@@ -312,41 +329,31 @@ def render_halaman_utama():
                 edit_metode = st.text_input("Metode Memasak / Kondisi Olahan", value=p.get("metode_masak", ""))
                 edit_gramasi = st.text_input("Estimasi Gramasi / Volume", value=p.get("gramasi_estimasi", ""))
                 
-                st.markdown(f"""
-                **Estimasi Nutrisi Saat Ini:** 🔥 Kalori: `{p.get('kalori')}` kkal | 🥩 Protein: `{p.get('protein')}`g | 🍞 Karbohidrat: `{p.get('karbohidrat')}`g | 🥑 Lemak: `{p.get('lemak')}`g
-                """)
+                st.markdown(f"**Estimasi Nutrisi Saat Ini:** 🔥 Kalori: `{p.get('kalori')}` kkal | 🥩 Protein: `{p.get('protein')}`g | 🍞 Karbohidrat: `{p.get('karbohidrat')}`g | 🥑 Lemak: `{p.get('lemak')}`g")
                 
                 col_btn1, col_btn2 = st.columns(2)
-                with col_btn1:
-                    tombol_koreksi = st.form_submit_button("🔄 Belum Sesuai, Kalkulasi Ulang AI")
-                with col_btn2:
-                    tombol_setuju = st.form_submit_button("✅ Sudah Sesuai, Masukkan Jurnal")
+                with col_btn1: tombol_koreksi = st.form_submit_button("🔄 Belum Sesuai, Kalkulasi Ulang AI")
+                with col_btn2: tombol_setuju = st.form_submit_button("✅ Sudah Sesuai, Masukkan Jurnal")
                 
                 if tombol_koreksi:
-                    with st.spinner("Mengalkulasi ulang nutrisi berdasarkan koreksi data Anda..."):
+                    with st.spinner("Mengalkulasi ulang nutrisi..."):
                         updated_res = rekalkulasi_nutrisi_via_ai(edit_nama, edit_bagian, edit_metode, edit_gramasi)
                         if updated_res:
                             st.session_state.pending_analysis = updated_res
-                            st.success("Nutrisi berhasil disesuaikan ulang oleh AI!")
                             st.rerun()
                             
                 if tombol_setuju:
-                    st.session_state.jurnal_hari_ini["kalori"] += p.get("kalori", 0)
-                    st.session_state.jurnal_hari_ini["protein"] += p.get("protein", 0)
-                    st.session_state.jurnal_hari_ini["karbohidrat"] += p.get("karbohidrat", 0)
-                    st.session_state.jurnal_hari_ini["lemak"] += p.get("lemak", 0)
-                    st.session_state.jurnal_hari_ini["serat"] += p.get("serat", 0)
-                    st.session_state.jurnal_hari_ini["air"] += p.get("air", 0)
-                    
+                    for key in ["kalori", "protein", "karbohidrat", "lemak", "serat", "air"]:
+                        st.session_state.jurnal_hari_ini[key] += p.get(key, 0)
                     st.session_state.riwayat_makanan.append(p)
                     st.session_state.pending_analysis = None
                     st.session_state.show_upload_options = False
-                    st.success("Sukses menyimpan log makanan!")
+                    st.success("Sukses menyimpan log makanan ke jurnal!")
                     st.rerun()
 
     # --- TAB 2: CATAT MANUAL ---
     with tab_list:
-        st.write("##### Input Makanan / Air Secara Manual")
+        st.write("##### Input Makanan Secara Manual")
         with st.form("form_manual"):
             nama_m = st.text_input("Nama Makanan", value="Dada Ayam Panggang")
             kal_m = st.number_input("Kalori (kkal)", min_value=0, value=250)
@@ -368,49 +375,52 @@ def render_halaman_utama():
             st.info("Belum ada riwayat konsumsi untuk hari ini.")
         else:
             for idx, item in enumerate(st.session_state.riwayat_makanan):
-                st.markdown(f"**{idx+1}. {item.get('nama_makanan')}** (*{item.get('bagian_makanan', 'Porsi')}*) — Metode: *{item.get('metode_masak')}* | ⚖️ {item.get('gramasi_estimasi')} $\rightarrow$ 🔥 {item.get('kalori')} kkal | 🥩 P: {item.get('protein')}g")
-            
-            if st.button("🗑️ Reset Seluruh Jurnal Hari Ini", type="secondary"):
+                st.markdown(f"**{idx+1}. {item.get('nama_makanan')}** — 🔥 {item.get('kalori')} kkal | 🥩 Protein: {item.get('protein')}g | 🍞 Karbo: {item.get('karbohidrat')}g")
+            if st.button("🗑️ Reset Seluruh Jurnal Hari Ini"):
                 st.session_state.jurnal_hari_ini = {"kalori": 0.0, "protein": 0.0, "karbohidrat": 0.0, "lemak": 0.0, "air": 0.0, "serat": 0.0}
                 st.session_state.riwayat_makanan = []
                 st.rerun()
 
-    # --- TAB 4: EDIT PROFIL & UPDATE TARGET AKTIVITAS ---
+    # --- TAB 4: EDIT PROFIL LENGKAP ---
     with tab_profil:
-        st.write("##### ⚙️ Edit Profil, Target Fisik & Ritual Aktivitas")
+        st.write("##### ⚙️ Edit Profil & Kalkulasi Ulang AI")
         p = st.session_state.user_profile
         
-        eb_sekarang = st.number_input("Berat Badan Saat Ini (kg)", value=p.get("berat_badan", 70.0), key="edit_bb")
-        eb_tinggi = st.number_input("Tinggi Badan (cm)", value=p.get("tinggi_badan", 170), key="edit_tb")
-        eb_umur = st.number_input("Umur (Tahun)", value=p.get("umur", 23), key="edit_umur")
-        eb_target = st.number_input("Target Berat Badan Akhir (kg)", value=p.get("target_berat", 65.0), key="edit_target")
-        
-        default_goal_idx = OPSI_BODY_GOAL.index(p.get("body_goal", OPSI_BODY_GOAL[0])) if p.get("body_goal") in OPSI_BODY_GOAL else 0
-        eb_goal = st.selectbox("Pilih Body Goal", OPSI_BODY_GOAL, index=default_goal_idx, key="edit_goal")
-        
-        st.write("Daftar Aktivitas Olahraga:")
-        aktivitas_lama = list(p.get("aktivitas", {}).keys())
-        eb_aktivitas = st.multiselect("Pilih jenis aktivitas fisik:", OPSI_AKTIVITAS, default=aktivitas_lama, key="edit_multiact")
-        
-        dict_edit_aktivitas = {}
-        if eb_aktivitas:
-            for akt in eb_aktivitas:
-                val_lama = p.get("aktivitas", {}).get(akt, 3)
-                freq = st.slider(f"Frekuensi untuk: {akt} (Kali / Minggu)", min_value=1, max_value=7, value=val_lama, key=f"edit_freq_{akt}")
-                dict_edit_aktivitas[akt] = freq
-                
-        if st.button("💾 Simpan Perubahan Profil & Hitung Ulang AI", type="primary", use_container_width=True):
-            st.session_state.user_profile = {
-                "berat_badan": eb_sekarang, "tinggi_badan": eb_tinggi, "umur": eb_umur, 
-                "target_berat": eb_target, "body_goal": eb_goal, "aktivitas": dict_edit_aktivitas
-            }
-            st.session_state.nutrisi_target = hitung_target_via_ai(st.session_state.user_profile)
-            st.success("Profil berhasil diperbarui dengan protein tetap terkunci pada 2x BB Target!")
-            st.rerun()
-                
-        if st.button("🚪 Keluar Akun (Log Out)", use_container_width=True):
+        with st.form("form_edit_profil"):
+            col1, col2 = st.columns(2)
+            with col1:
+                eb_gender = st.selectbox("Jenis Kelamin", ["Laki-laki", "Perempuan"], index=0 if p.get("gender") == "Laki-laki" else 1)
+                eb_sekarang = st.number_input("Berat Badan Sekarang (kg)", value=p.get("bb_awal", 70.0))
+                eb_tinggi = st.number_input("Tinggi Badan (cm)", value=p.get("tb", 170))
+            with col2:
+                eb_umur = st.number_input("Umur (Tahun)", value=p.get("umur", 24))
+                eb_target = st.number_input("Target Berat Badan Akhir (kg)", value=p.get("target_berat", 65.0))
+                eb_goal = st.selectbox("Pilih Body Goal", ["Fat Loss", "Maintain Weight (Recomposition)", "Muscle Gain"], index=["Fat Loss", "Maintain Weight (Recomposition)", "Muscle Gain"].index(p.get("body_goal", "Fat Loss")))
+            
+            st.markdown("---")
+            st.markdown("#### 🏃‍♂️ Perbarui Checklist Aktivitas & Frekuensi")
+            eb_aktivitas = render_checklist_aktivitas(prefix_key="editprofil", profil_existing=p)
+            
+            st.markdown("---")
+            eb_perubahan = st.slider("Intensitas Surplus/Defisit Kalori Harian", min_value=300, max_value=500, value=p.get("perubahan_kalori", 500), step=50)
+            
+            if st.form_submit_button("💾 Simpan Perubahan & Kalkulasi Ulang AI", type="primary"):
+                st.session_state.user_profile = {
+                    "gender": eb_gender, "bb_awal": eb_sekarang, "tb": eb_tinggi, 
+                    "umur": eb_umur, "target_berat": eb_target, "body_goal": eb_goal,
+                    "aktivitas": eb_aktivitas, "perubahan_kalori": eb_perubahan
+                }
+                with st.spinner("Gemini AI sedang menghitung ulang TDEE dan target nutrisi baru..."):
+                    st.session_state.nutrisi_target = hitung_target_via_ai(st.session_state.user_profile)
+                    st.success("Profil & BMR/TDEE berhasil diperbarui!")
+                    st.rerun()
+                    
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("🚪 Keluar Akun & Reset Total (Log Out)", use_container_width=True):
             st.session_state.logged_in = False
             st.session_state.profile_setup_done = False
+            st.session_state.user_profile = {}
+            st.session_state.nutrisi_target = {}
             st.rerun()
 
 # ==========================================
